@@ -1,83 +1,119 @@
-import requests
+"""
+core/scraper.py
+---------------
+Scrapes live LinkedIn job counts for skills using Playwright connected
+to a Bright Data remote browser over WebSocket CDP (wss:// URL).
+
+Why Playwright instead of requests?
+  LinkedIn blocks plain HTTP scrapers. Bright Data's Browser API spins up
+  a real Chromium instance in the cloud, bypassing bot detection.
+  We connect to it via the wss:// URL from your .env file.
+
+Requirements:
+  pip install playwright
+  playwright install chromium   # only needed for local fallback
+"""
+
+import asyncio
 import re
 import time
 from datetime import datetime
-from config import BRIGHT_DATA_API_KEY, BRIGHT_DATA_ENDPOINT
 
+from playwright.async_api import async_playwright
+
+from config import BRIGHTDATA_WS_URL
+
+
+# ── Internal async scraper ────────────────────────────────────────────────────
+
+async def _scrape_skill_async(skill: str) -> dict:
+    """
+    Open a remote Bright Data browser page, navigate to LinkedIn Jobs,
+    extract the job count, and return a structured result dict.
+    """
+    async with async_playwright() as pw:
+        # Connect to Bright Data's cloud browser over WebSocket
+        browser = await pw.chromium.connect_over_cdp(BRIGHTDATA_WS_URL)
+        try:
+            page = await browser.new_page()
+
+            url = (
+                f"https://www.linkedin.com/jobs/search/"
+                f"?keywords={skill}&location=Worldwide"
+            )
+            await page.goto(url, timeout=120_000)
+
+            # Wait for the job count element to appear
+            try:
+                await page.wait_for_selector(
+                    ".results-context-header__job-count, "
+                    ".jobs-search-results-list__subtitle",
+                    timeout=15_000,
+                )
+            except Exception:
+                pass  # Element may not appear; fall through to regex
+
+            html = await page.content()
+
+            # Try to extract job count
+            match = re.search(r"([\d,]+)\s+(?:results|jobs)", html)
+            job_count = int(match.group(1).replace(",", "")) if match else 0
+
+        finally:
+            await browser.close()
+
+    market_demand_score = round(min(10.0, job_count / 50_000 * 10), 2)
+
+    return {
+        "skill": skill,
+        "job_count": job_count,
+        "market_demand_score": market_demand_score,
+        "demand_score": market_demand_score,   # alias for scorer.py compat
+        "action": "maintain",
+        "scraped_at": datetime.now().isoformat(),
+    }
+
+
+async def _scrape_all_async(skills: list) -> dict:
+    """Scrape all skills sequentially (1 s gap) to avoid rate limits."""
+    results: dict = {}
+    for i, skill in enumerate(skills):
+        try:
+            results[skill] = await _scrape_skill_async(skill)
+        except Exception as e:
+            results[skill] = {
+                "skill": skill,
+                "job_count": 0,
+                "market_demand_score": 5.0,
+                "demand_score": 5.0,
+                "action": "maintain",
+                "error": str(e),
+                "scraped_at": datetime.now().isoformat(),
+            }
+        if i < len(skills) - 1:
+            await asyncio.sleep(1)
+    return results
+
+
+# ── Public sync API (called by Gradio, which runs in a sync context) ──────────
 
 def scrape_skill_demand(skill: str) -> dict:
     """
-    Scrapes real-time job market data for a given skill using the Bright Data API.
-
-    Args:
-        skill: The skill to search for on LinkedIn Jobs
-
-    Returns:
-        dict with skill, job_count, market_demand_score, and scraped_at timestamp.
-        NOTE: key is 'market_demand_score' (0-10) to match chart/portfolio expectations.
+    Synchronous wrapper around the async Playwright scraper.
+    Safe to call from Gradio event handlers.
     """
-    try:
-        headers = {
-            "Authorization": f"Bearer {BRIGHT_DATA_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        body = {
-            "url": f"https://www.linkedin.com/jobs/search/?keywords={skill}&location=Worldwide",
-            "format": "raw_html",
-        }
-
-        response = requests.post(BRIGHT_DATA_ENDPOINT, headers=headers, json=body)
-        response.raise_for_status()
-
-        html_content = response.text
-
-        # Extract job count using regex
-        match = re.search(r"([\d,]+)\s+(?:results|jobs)", html_content)
-        if match:
-            job_count = int(match.group(1).replace(",", ""))
-        else:
-            job_count = 0
-
-        market_demand_score = round(min(10.0, job_count / 50000 * 10), 2)
-
-        return {
-            "skill": skill,
-            "job_count": job_count,
-            "market_demand_score": market_demand_score,  # unified key name
-            "demand_score": market_demand_score,          # kept for scorer.py compat
-            "action": "maintain",                         # default; overridden by LLM
-            "scraped_at": datetime.now().isoformat(),
-        }
-
-    except Exception as e:
-        return {
-            "skill": skill,
-            "job_count": 0,
-            "market_demand_score": 5.0,
-            "demand_score": 5.0,
-            "action": "maintain",
-            "error": str(e),
-            "scraped_at": datetime.now().isoformat(),
-        }
+    return asyncio.run(_scrape_skill_async(skill))
 
 
 def get_market_data(skills: list) -> dict:
     """
-    Fetches market data for a list of skills.
+    Fetch market data for a list of skills via Playwright + Bright Data.
 
     Returns:
-        dict mapping skill name → result dict (NO extra 'summary' key —
-        that key broke downstream iteration over the dict).
+        dict mapping skill name -> result dict.
+        Only skill keys — no extra 'summary' key — safe to iterate everywhere.
     """
-    results: dict = {}
-
-    for i, skill in enumerate(skills):
-        results[skill] = scrape_skill_demand(skill)
-        if i < len(skills) - 1:
-            time.sleep(1)
-
-    return results          # clean: only skill keys, no 'summary' pollution
+    return asyncio.run(_scrape_all_async(skills))
 
 
 def get_trending_skills() -> list:
